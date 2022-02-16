@@ -1,3 +1,4 @@
+import collections
 import json
 import operator
 import random
@@ -22,48 +23,50 @@ class Wordler:
 
     responses: list[str]
     guesses: list[str]
-    bank: dict[str, float]
+    bank: dict[str, list[float, bool]]
 
     def __init__(self):
-        self.reset()
-
-    def reset(self):
         self.responses = []
         self.guesses = []
         with open('freq_map.json') as fp:
             self.bank = {
-                word: sc.expit((Wordler.H_OFFSET - i) / Wordler.H_SCALE)
+                word: [sc.expit((Wordler.H_OFFSET - i) / Wordler.H_SCALE), True]
                 for i, (word, freq)
                 in enumerate(sorted(json.load(fp)['words'].items(), key=operator.itemgetter(1)))
             }
 
-    def record_response(self, guess: str, response: typing.Union[list, str]):
+    def reset(self):
+        self.responses = []
+        self.guesses = []
+        for word in self.bank:
+            self.bank[word][1] = True
+
+    def record_response(self, guess: str, response: typing.Union[list, str], human=False):
         """Record the last guess and the game's response."""
         assert len(guess) == 5
         assert len(response) == 5
         self.guesses.append(guess.casefold())
         if all(isinstance(x, str) for x in response):
             assert all(x in Wordler._emojis for x in response)
-            self.responses.append(response)
         elif all(isinstance(x, int) for x in response):
             assert all(0 <= x <= 2 for x in response)
-            self.responses.append(''.join(Wordler._emojis[x] for x in response))
+            response = ''.join(Wordler._emojis[x] for x in response)
         else:
             raise ValueError('invalid response')
 
-        self.bank = {
-            word: freq
-            for word, freq in self.bank.items()
-            if Wordler.calc_response(self.guesses[-1], word) == self.responses[-1]
-        }
+        self.responses.append(response)
+        for word in self.bank:
+            if Wordler.calc_response(guess, word) != response:
+                self.bank[word][0] = 0.0
     
     def entropy(self, guess: str):
         """Calculate the entropy of the guess."""
-        addend = 1 / len(self.bank)
-        check = {''.join(response): 0 for response in itertools.product(Wordler._emojis, repeat=5)}
-        for word, freq in self.bank.items():
-            check[self.calc_response(guess, word)] += addend * freq
-        return sum(-x * np.log2(x) if x != 0 else 0 for x in check.values())
+        addend = 1 / sum(1 for word, (freq, flag) in self.bank.items() if freq != 0)
+        check = collections.defaultdict(float)
+        for word, (freq, flag) in self.bank.items():
+            if freq != 0:
+                check[self.calc_response(guess, word)] += addend * freq
+        return sum(-x * np.log2(x) for x in check.values())
 
     @staticmethod
     def prompt_response(guess: str):
@@ -105,10 +108,19 @@ class Wordler:
         else:
             return Wordler.calc_response(guess, solution)
 
-    def make_guess(self, turn: int):
+    def prompt_guess(self, turn: int):
+        while True:
+            guess = input(f'Round {turn} > ').casefold()
+            if guess in self.bank:
+                return guess, self.entropy(guess)
+            print(f'Invalid word: {guess}')
+
+    def make_guess(self, turn: int, human=False):
+        if human:
+            return self.prompt_guess(turn)
         if turn == 1:
             return 'tares', self.entropy('tares')
-        entropies: list[tuple[str, float]] = [(word, self.entropy(word)) for word in self.bank]
+        entropies: list[tuple[str, float]] = [(word, self.entropy(word)) for word, (freq, flag) in self.bank.items() if freq != 0]
         entropies.sort(reverse=True, key=operator.itemgetter(1))
         if len(entropies) > 1 and entropies[1][1] == entropies[0][1]:
             choices = list(itertools.takewhile(lambda x: x[1] == entropies[0][1], entropies))
@@ -116,7 +128,7 @@ class Wordler:
         else:
             return entropies[0]
 
-    def play(self, secret: str = None):
+    def play(self, secret: str = None, human=False):
         """Play the game.
         If secret is None, the solution is chosen externally.
         Otherwise, autoplay with the given solution."""
@@ -132,13 +144,20 @@ class Wordler:
                   "2 = green (letter in the correct place)\n\n"
                   "If the word I suggest is not in the app's wordbank,\n"
                   "say \"xxxxx\".")
+        elif human:
+            print('This is a wordle clone.\n\n'
+                  'On each round, you will guess a 5-letter word.\n'
+                  'I will tell you how close you are to the solution using the following hints:\n\n'
+                  '⬛ - The letter is not in the solution\n'
+                  '🟨 - The letter is in the solution but not in that position\n'
+                  '🟩 - The letter is in the solution at that position')
         for i in range(1, 7):
             # The initial guess of 'tares' was chosen by playing one round of this game with no prior information.
             # Since the entropy calculation is O(n^2), we only want to do this opening move calculation once.
             while True:
-                guess, entropy = self.make_guess(i)
+                guess, entropy = self.make_guess(i, human=human)
                 response = Wordler.get_response(guess, secret)
-                self.bank.pop(guess)
+                self.bank[guess][1] = False
                 if response is not None:
                     break
                 assert i != 1, 'The initial guess is a guaranteed word. You are pulling my leg here.'
@@ -148,7 +167,7 @@ class Wordler:
                 suffix = 'tsnrhtdd'[((i // 10) % 10 != 1) * (i % 10 < 4) * (i % 10)::4]
                 print(f'Got it on the {i}{suffix} try!')
                 break
-            self.record_response(guess, response)
+            self.record_response(guess, response, human=human)
             if not self.bank:
                 raise ValueError('ruled out all possibilities somehow (secret = {})'.format(secret))
         else:
@@ -160,22 +179,28 @@ class Wordler:
 
 class Namespace(argparse.Namespace):
     auto: typing.Union[bool, str, None]
+    human: bool
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--auto', nargs='?', const=False)
+    parser.add_argument('--auto', nargs='?', const=False,
+                        help='The game runs itself against a given solution. '
+                             'If no solution is given, one is chosen at random from the word bank.')
+    parser.add_argument('--human', action='store_true',
+                        help='You the user are playing the game. This cannot be used in tandem with --auto.')
     args = parser.parse_args(namespace=Namespace())
     game = Wordler()
     secret: typing.Optional[str]
-    if args.auto is None:
+    if args.auto is None and not args.human:
         secret = None
     elif args.auto:
         assert args.auto in game.bank, 'I don\'t know that word!'
+        assert not args.human, 'Can\'t have a solution with --human'
         secret = args.auto
     else:
-        secret = random.choice(game.bank)
-    game.play(secret)
+        secret = random.choice(list(game.bank))
+    game.play(secret, human=args.human)
 
 
 if __name__ == '__main__':
